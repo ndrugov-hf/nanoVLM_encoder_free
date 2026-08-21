@@ -30,13 +30,8 @@ class VLMConfig:
     lm_max_length: int = 4096
     lm_use_tokens: bool = False # Decide if the LM expects tokens or embeddings as input (if using as a backbone for the VLM, set to False)
     lm_tie_weights: bool = True # Decide if you want to tie the LM Head weight to the token embedding weights
-    
-    
-    lm_model_type: str = 'LiquidAI/LFM2.5-1.2B-Instruct' #'HuggingFaceTB/SmolLM2-135M' or 'LiquidAI/LFM2.5-230M' or 'HuggingFaceTB/SmolLM2-360M-Instruct'
-    lm_tokenizer: str = 'LiquidAI/LFM2.5-1.2B-Instruct' # 'LiquidAI/LFM2.5-230M' or 'HuggingFaceTB/SmolLM2-360M-Instruct'
-    lm_backend: str = "hf" # "hf" or "custom"
-    
-    
+    lm_model_type: str = 'HuggingFaceTB/SmolLM2-360M-Instruct' #'HuggingFaceTB/SmolLM2-135M' #
+    lm_tokenizer: str = 'HuggingFaceTB/SmolLM2-360M-Instruct'
     lm_chat_template: str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 
     mp_pixel_shuffle_factor: int = 4
@@ -60,7 +55,7 @@ class VLMConfig:
     vision_backend: str = "encoder_free" # "encoder_free" or "vit"
 
     teacher_patch_size: int = 16
-    pooling_kernel_size: int = 2
+    pooling_kernel_size: int = 3
     model_patch_size: int = teacher_patch_size * pooling_kernel_size  # 48 px per model patch
     model_flat_patch_dim: int = 3 * (model_patch_size ** 2)           # 3*48*48 = 6912 raw values per patch
     max_soft_tokens: int = 280        # per-image budget of model patches the image processor emits (one of {70,140,280,560,1120}; Gemma 4 default 280). Distinct from mm_posemb_size below. Read by data/image_processing.py.
@@ -99,14 +94,14 @@ class VLMConfig:
         self.lm_hidden_dim = hidden_size
         self.mm_embed_dim = hidden_size
     # ------------------------ END OF CHANGE ------------------------
-        
+
 
 
 @dataclass
 class TrainConfig:
     lr_mp: float = 0.00512
     lr_vision_backbone: float = 5e-5 #0.0005 #
-    lr_language_backbone: float = 5e-5 
+    lr_language_backbone: float = 5e-5
 
     # ------------------------ CHANGE ------------------------
     # Added learning rates for components of the encoder-free VLM,
@@ -127,15 +122,15 @@ class TrainConfig:
     max_sample_length: int = 4096
     compile: bool = False
     resume_from_vlm_checkpoint: bool = False # Indicate if the training should be resumed from a checkpoint of the whole VLM or you want to start from scratch
-    
-    
+
+
     train_dataset_path: str = 'HuggingFaceM4/FineVision_concat_shuffled_2' # 'HuggingFaceM4/FineVision_concat_shuffled_2' or 'HuggingFaceM4/FineVision'
     train_dataset_name: tuple[str, ...] = ("default", ) #('allava_laion', 'allava_vflan', 'cambrian(filtered)_processed', 'LLaVA_Instruct_150K', 'mmevol', 'sharegpt4o', 'sharegpt4v(coco)', 'sharegpt4v(knowledge)', 'sharegpt4v(llava)', 'sharegpt4v(sam)') # 'vision_flan(filtered)', 'lvis_instruct4v',
-    
+
     # train_dataset_path: str = 'HuggingFaceM4/FineVision'
-    # train_dataset_name: tuple[str, ...] = ('LLaVA_Instruct_150K', )
-    
-    
+    # train_dataset_name: tuple[str, ...] = ('funsd', )
+
+
     stream_dataset: bool = True
     relevance_min_rating: int = 1
     image_correspondence_min_rating: int = 1

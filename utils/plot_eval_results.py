@@ -312,7 +312,7 @@ def plot_results(all_results, eval_folders, custom_names=None, tasks_to_plot=Non
     plt.tight_layout()
     
     # Create assets folder if it doesn't exist
-    assets_folder = '/fsx/luis_wiedmann/nanoVLM/plots_final'
+    assets_folder = '/fsx/$USER/nanoVLM/plots_final'
     os.makedirs(assets_folder, exist_ok=True)
     
     # Save the plot to assets folder
@@ -438,7 +438,7 @@ def save_individual_plot_pdf(all_results, eval_folders, custom_names, output_fil
     plt.tight_layout(pad=1.5)
     
     # Create assets folder if it doesn't exist
-    assets_folder = '/fsx/luis_wiedmann/nanoVLM/plots_final'
+    assets_folder = '/fsx/$USER/nanoVLM/plots_final'
     os.makedirs(assets_folder, exist_ok=True)
     
     # Generate filename for individual plot PDF

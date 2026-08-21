@@ -30,11 +30,14 @@ class ConstantLengthDataset(IterableDataset):
         self.max_images_per_example = max_images_per_example
         self.max_images_per_knapsack = max_images_per_knapsack
         self._sentinel = object()
+
+        # NOTE: this value is incorrect/irrelevant when cfg.vision_backend == "encoder_free"
         self._average_length_per_sample = (
             self.dataset.mp_image_token_length + 198
         )  # 198 is the average tokens for the cauldron dataset
 
     def __len__(self):
+        # NOTE: this value is incorrect/irrelevant when cfg.vision_backend == "encoder_free"
         return int(
             len(self.dataset) * self._average_length_per_sample / self.seq_length
         )

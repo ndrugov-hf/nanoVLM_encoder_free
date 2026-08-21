@@ -29,7 +29,7 @@ from data.datasets import VQADataset
 from data.collators import VQACollator
 from data.data_utils import synchronized_dataloader_step
 from data.advanced_datasets import ConstantLengthDataset
-from data.processors import get_image_processor, get_tokenizer
+from data.processors import get_image_processor, get_tokenizer, get_image_processor_encoder_free
 
 import models.config as config
 from models.vision_language_model import VisionLanguageModel
@@ -114,7 +114,15 @@ def get_run_name(train_cfg, vlm_cfg):
 def get_dataloaders(train_cfg, vlm_cfg):
     print(f"Getting dataloaders from {train_cfg.train_dataset_path}")
     # Create datasets
-    image_processor = get_image_processor(vlm_cfg.max_img_size, vlm_cfg.vit_img_size, vlm_cfg.resize_to_max_side_len)
+    # ------------------------ CHANGE ------------------------
+    # Add branching based on vlm_cfg.vision_backend. Preivously, there was no 
+    # branching and the vision_backend="vit" was always executed
+    if vlm_cfg.vision_backend == "encoder_free":
+        image_processor = get_image_processor_encoder_free(vlm_cfg)
+    else:
+        image_processor = get_image_processor(vlm_cfg.max_img_size, vlm_cfg.vit_img_size, vlm_cfg.resize_to_max_side_len, )
+    
+    # --------------------- END OF CHANGE ---------------------
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer, vlm_cfg.vlm_extra_tokens, vlm_cfg.lm_chat_template)
 
     dataset_names_to_load = train_cfg.train_dataset_name
@@ -175,6 +183,8 @@ def get_dataloaders(train_cfg, vlm_cfg):
         val_ds = train_ds.select(range(val_size))
         train_ds = train_ds.select(range(val_size, len(train_ds)))
 
+    # ------------------------ CHANGE ------------------------
+    # Pass vision_backend to the VQADataset and VQACollator constructors
     train_dataset = VQADataset(
         train_ds,
         tokenizer,
@@ -184,6 +194,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_cfg.image_correspondence_min_rating,
         train_cfg.visual_dependency_min_rating,
         train_cfg.formatting_min_rating,
+        vision_backend=vlm_cfg.vision_backend
     )
     val_dataset = VQADataset(
         val_ds,
@@ -194,6 +205,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         train_cfg.image_correspondence_min_rating,
         train_cfg.visual_dependency_min_rating,
         train_cfg.formatting_min_rating,
+        vision_backend=vlm_cfg.vision_backend
     )
 
     train_dataset = ConstantLengthDataset(train_dataset, infinite=False, max_sample_length=train_cfg.max_sample_length, seq_length=vlm_cfg.lm_max_length, num_of_sequences=train_cfg.batch_size*4, queue_size=8,
@@ -203,7 +215,8 @@ def get_dataloaders(train_cfg, vlm_cfg):
                                         max_images_per_example=train_cfg.max_images_per_example, max_images_per_knapsack=train_cfg.max_images_per_knapsack)
 
     # Create collators
-    vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
+    vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length, vision_backend=vlm_cfg.vision_backend)
+    # --------------------- END OF CHANGE ---------------------
 
     g = torch.Generator()
     g.manual_seed(0)
@@ -276,7 +289,7 @@ def train(train_cfg, vlm_cfg):
     if train_cfg.log_wandb and is_master():
         run = wandb.init(
             entity=train_cfg.wandb_entity,
-            project="nanoVLM",
+            project="nanoVLM_encoder_free",
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg)
@@ -307,21 +320,44 @@ def train(train_cfg, vlm_cfg):
     # Since we have pretrained vision and language backbones, but a newly initialized modality projection layer, it doesn't make sense to train them with the same learning rate
     # You could opt to fully freeze the backbones and only train the MP layer, but finetuning them with a lower learning rate makes the training as a whole easier
     param_groups = []
-    if train_cfg.lr_mp > 0:
-        param_groups.append({'params': list(model.MP.parameters()), 'lr': train_cfg.lr_mp})
+
+    # ------------------------ CHANGE ------------------------
+    # Added the if-else branching. Before, there was no branching, and the vision_backend="vit"
+    # branch was always executed
+    if vlm_cfg.vision_backend == "encoder_free":
+        if train_cfg.lr_vision_projector > 0:
+            param_groups.append({'params': list(model.vision_projector.parameters()), 'lr': train_cfg.lr_vision_projector})
+        else:
+            for p in list(model.vision_projector.parameters()):
+                p.requires_grad = False
+        if train_cfg.lr_vision_embedder > 0:
+            param_groups.append({'params': list(model.vision_embedder.parameters()), 'lr': train_cfg.lr_vision_embedder})
+        else:
+            for p in list(model.vision_embedder.parameters()):
+                p.requires_grad = False
+        if train_cfg.lr_language_backbone > 0:
+            param_groups.append({'params': list(model.decoder.parameters()), 'lr': train_cfg.lr_language_backbone})
+        else:
+            for p in list(model.decoder.parameters()):
+                p.requires_grad = False
+    
     else:
-        for p in list(model.MP.parameters()):
-            p.requires_grad = False
-    if train_cfg.lr_vision_backbone > 0:
-        param_groups.append({'params': list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_vision_backbone})
-    else:
-        for p in list(model.vision_encoder.parameters()):
-            p.requires_grad = False
-    if train_cfg.lr_language_backbone > 0:
-        param_groups.append({'params': list(model.decoder.parameters()), 'lr': train_cfg.lr_language_backbone})
-    else:
-        for p in list(model.decoder.parameters()):
-            p.requires_grad = False
+        if train_cfg.lr_mp > 0:
+            param_groups.append({'params': list(model.MP.parameters()), 'lr': train_cfg.lr_mp})
+        else:
+            for p in list(model.MP.parameters()):
+                p.requires_grad = False
+        if train_cfg.lr_vision_backbone > 0:
+            param_groups.append({'params': list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_vision_backbone})
+        else:
+            for p in list(model.vision_encoder.parameters()):
+                p.requires_grad = False
+        if train_cfg.lr_language_backbone > 0:
+            param_groups.append({'params': list(model.decoder.parameters()), 'lr': train_cfg.lr_language_backbone})
+        else:
+            for p in list(model.decoder.parameters()):
+                p.requires_grad = False
+    # --------------------- END OF CHANGE ---------------------
 
     optimizer = optim.AdamW(param_groups)
     all_params = [p for group in optimizer.param_groups for p in group['params']]
@@ -409,22 +445,43 @@ def train(train_cfg, vlm_cfg):
             if is_update_step:
                 if train_cfg.max_grad_norm is not None:
                     grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=train_cfg.max_grad_norm)
+                
+                # ------------------------ CHANGE ------------------------
+                # Added the if-else branching. Before, there was no branching, and the vision_backend="vit"
+                # branch was always executed
+                if vlm_cfg.vision_backend == "encoder_free":
+                    param_group_idx = 0
+                    if train_cfg.lr_vision_projector > 0:
+                        adj_lr_vision_projector = get_lr(global_step, train_cfg.lr_vision_projector, train_cfg.max_training_steps)
+                        optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_projector
+                        param_group_idx += 1
 
-                param_group_idx = 0
-                if train_cfg.lr_mp > 0:
-                    adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, train_cfg.max_training_steps)
-                    optimizer.param_groups[param_group_idx]['lr'] = adj_lr_mp
-                    param_group_idx += 1
+                    if train_cfg.lr_vision_embedder > 0:
+                        adj_lr_vision_embedder = get_lr(global_step, train_cfg.lr_vision_embedder, train_cfg.max_training_steps)
+                        optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_embedder
+                        param_group_idx += 1
 
-                if train_cfg.lr_vision_backbone > 0:
-                    adj_lr_vision_backbone = get_lr(global_step, train_cfg.lr_vision_backbone, train_cfg.max_training_steps)
-                    optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_backbone
-                    param_group_idx += 1
+                    if train_cfg.lr_language_backbone > 0:
+                        adj_lr_language_backbone = get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps)
+                        optimizer.param_groups[param_group_idx]['lr'] = adj_lr_language_backbone
 
-                if train_cfg.lr_language_backbone > 0:
-                    adj_lr_language_backbone = get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps)
-                    optimizer.param_groups[param_group_idx]['lr'] = adj_lr_language_backbone
-              
+                else:
+                    param_group_idx = 0
+                    if train_cfg.lr_mp > 0:
+                        adj_lr_mp = get_lr(global_step, train_cfg.lr_mp, train_cfg.max_training_steps)
+                        optimizer.param_groups[param_group_idx]['lr'] = adj_lr_mp
+                        param_group_idx += 1
+
+                    if train_cfg.lr_vision_backbone > 0:
+                        adj_lr_vision_backbone = get_lr(global_step, train_cfg.lr_vision_backbone, train_cfg.max_training_steps)
+                        optimizer.param_groups[param_group_idx]['lr'] = adj_lr_vision_backbone
+                        param_group_idx += 1
+
+                    if train_cfg.lr_language_backbone > 0:
+                        adj_lr_language_backbone = get_lr(global_step, train_cfg.lr_language_backbone, train_cfg.max_training_steps)
+                        optimizer.param_groups[param_group_idx]['lr'] = adj_lr_language_backbone
+                # --------------------- END OF CHANGE ---------------------
+
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -437,7 +494,14 @@ def train(train_cfg, vlm_cfg):
             total_tokens_processed += num_tokens
             post_process_time = time.time() - post_process_start
 
-            images_per_sample = [len(image_pack) for image_pack in images]
+            # ------------------------ CHANGE ------------------------
+            # Added the if-else branching. Before, there was no branching, and the vision_backend="vit"
+            # branch was always executed
+            if vlm_cfg.vision_backend == "encoder_free": 
+                images_per_sample = [-1,]
+            else:
+                images_per_sample = [len(image_pack) for image_pack in images]
+            # --------------------- END OF CHANGE ---------------------
 
             batch_end_time = time.time()
             batch_duration = batch_end_time - batch_start_time

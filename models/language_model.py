@@ -555,7 +555,15 @@ class LanguageModel(nn.Module):
         cfg.lm_hidden_dim = hf_config.hidden_size
         cfg.lm_inter_dim = hf_config.intermediate_size
         cfg.lm_rms_eps = hf_config.rms_norm_eps
-        cfg.lm_re_base = hf_config.rope_theta
+        
+        # ------------------------- CHANGE -------------------------
+        # Old: cfg.lm_re_base = hf_config.rope_theta
+        #   transformers 5 moved rope_theta into the rope_parameters dict, so the
+        #   old top-level attribute no longer exists on LlamaConfig.
+        # New:
+        cfg.lm_re_base = getattr(hf_config, "rope_theta", None) or hf_config.rope_parameters["rope_theta"]
+        # ---------------------- END OF CHANGE ----------------------
+
         cfg.lm_max_position_embeddings = hf_config.max_position_embeddings
         # We're keeping our own vocab size in cfg, but checking it's larger than original
         if hasattr(cfg, 'lm_vocab_size'):

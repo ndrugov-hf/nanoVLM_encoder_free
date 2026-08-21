@@ -1,3 +1,17 @@
+"""
+Usage (run as a module, not a script):
+
+    python -m eval.measure_vram \\
+        --batch_sizes "1 2 4 8" \\
+        --lm_max_length 4096 \\
+        --lm_model_type LiquidAI/LFM2.5-1.2B-Instruct \\
+        --num_iterations 8
+
+This will load the encoder-free VLM with the given language model config and
+measure peak VRAM for each batch size over the requested number of forward/
+backward iterations.
+"""
+
 import torch
 import argparse
 import torch.optim as optim

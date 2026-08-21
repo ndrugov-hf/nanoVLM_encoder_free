@@ -16,8 +16,21 @@ set -euo pipefail
 # Clean distributed defaults that can confuse eval scripts
 unset RANK LOCAL_RANK WORLD_SIZE MASTER_ADDR MASTER_PORT NCCL_SOCKET_IFNAME
 
-cd /fsx/andi/nanoVLM
+# train.py submits this eval job with `sbatch eval.slurm ...` from inside the
+# training allocation. sbatch defaults to --export=ALL, so the eval job
+# inherits the parent training job's SLURM GPU/GRES env vars. From an 8-GPU
+# run these carry SLURM_JOB_GPUS=0-7 etc., which no longer match the eval
+# job's own 4-GPU allocation. The inner `srun --gres=gpu:1` below then dies
+# with "Invalid generic resource (gres) specification".
+# Drop the inherited GPU/GRES vars so srun uses this job's real allocation.
+# Safe: NUM_GPUS below is derived from SLURM_GPUS_ON_NODE, which SLURM re-sets
+# for THIS job's allocation, so detection still works.
+unset SLURM_GPUS SLURM_JOB_GPUS SLURM_STEP_GPUS SLURM_GPUS_PER_NODE \
+      SLURM_GPUS_PER_TASK SLURM_GRES SLURM_JOB_GRES SLURM_STEP_GRES
+
+cd /fsx/$USER/nanoVLM_encoder_free
 source .venv/bin/activate
+export HF_TOKEN=$(cat "$HOME/.cache/huggingface/token")
 export TOKENIZERS_PARALLELISM=false
 
 if [ "$#" -ne 6 ]; then

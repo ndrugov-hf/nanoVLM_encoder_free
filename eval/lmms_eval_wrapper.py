@@ -16,7 +16,11 @@ from lmms_eval.api.model import lmms
 from lmms_eval.api.instance import Instance
 
 from models.vision_language_model import VisionLanguageModel
-from data.processors import get_tokenizer, get_image_processor, get_image_string
+# ------------------------ CHANGE ------------------------
+# Import encoder-free versions of get_image_processor and get_image_string
+from data.processors import get_tokenizer, get_image_processor_encoder_free, get_image_string_encoder_free
+# --------------------- END OF CHANGE ---------------------   
+
 from data.collators import VQACollator
 
 
@@ -31,10 +35,19 @@ class NanoVLMWrapper(lmms):
         **kwargs
     ):
         super().__init__()
+
         if isinstance(model, str):
             self.model = VisionLanguageModel.from_pretrained(model).to(device)
         else:
             self.model = model.to(device)
+
+        # ------------------------ CHANGE ------------------------
+        # Check the backend on the loaded model, not the raw `model` argument: when `model` is a
+        # checkpoint-path string (how lmms-eval's CLI instantiates us) it has no `.cfg` until it is
+        # loaded, so this assert must run after from_pretrained.
+        assert self.model.cfg.vision_backend == "encoder_free", "This eval works only when model.cfg.vision_backend == 'encoder_free'"
+        # --------------------- END OF CHANGE ---------------------
+
         self.device = device
         self.batch_size = batch_size
         
@@ -52,53 +65,222 @@ class NanoVLMWrapper(lmms):
         if hasattr(self.model.cfg, "resize_to_max_side_len"):
             resize_to_max_side_len = self.model.cfg.resize_to_max_side_len
         print(f"Resize to max side len: {resize_to_max_side_len}")
-        self.image_processor = get_image_processor(self.model.cfg.max_img_size, self.model.cfg.vit_img_size, resize_to_max_side_len)
-            
-    def _prepare_visual_input(self, visual_list: List[Image.Image]) -> Optional[torch.Tensor]:
-        """Convert visual inputs to model format."""
-        if not visual_list or visual_list[0] is None: # Still check if the list is empty or contains None
-            return None, None
-            
-        images = []
-        splitted_image_ratios = []
-        for visual in visual_list:
-            image = None
-            if isinstance(visual, Image.Image):
-                image = visual
-            elif isinstance(visual, str): # Keep path loading for convenience
-                image = Image.open(visual).convert("RGB")
-            elif isinstance(visual, np.ndarray): # Keep numpy array loading for convenience
-                image = Image.fromarray(visual)
-            else:
-                # If it's not an Image, a path string, or a numpy array, it's an error
-                raise ValueError(f"Unsupported visual type: {type(visual)}. Expected PIL Image, path string, or numpy array.")
-            
-            # Process image
-            processed_images, splitted_image_ratio = self.image_processor(image)
-            if not hasattr(self.tokenizer, "global_image_token") and splitted_image_ratio[0]*splitted_image_ratio[1] == len(processed_images) - 1:
-                # If the tokenizer doesn't have a global image token, but the processor generated it, remove it
-                processed_images = processed_images[1:]
+        # ------------------------ CHANGE ------------------------
+        # Using get_image_processor_encoder_free() instead of get_image_processor()
+        self.image_processor = get_image_processor_encoder_free(self.model.cfg)
+        # --------------------- END OF CHANGE ---------------------    
 
-            images.append(processed_images)
-            splitted_image_ratios.append(splitted_image_ratio)
-        
-        if images:
-            return images, splitted_image_ratios
-        return None, None
-        
+    def _prepare_visual_input(
+        self,
+        visual_list: list[list[Image.Image | str | np.ndarray] | None],
+    ) -> tuple[list[list[dict[str, torch.Tensor]]], list[list[int]]]:
+        """
+        Purpose:
+            Turn one evaluation batch's raw images into encoder-free image data, kept grouped
+            by sample. lmms-eval hands us the batch's images as one entry per sample: a list of
+            that sample's images, or None (or an empty list) for a text-only sample. Each image
+            is run through the encoder-free ImageProcessor on its own (resize -> cut into patches
+            -> merge each k x k block of patches into one model patch -> pad to a fixed length),
+            and its result becomes one dict. The per-image dicts for a sample are collected into
+            that sample's own list, so the sample-to-image grouping is preserved for the caller.
+
+            This is the batch-level, eval sibling of the training-path
+            `_process_images_encoder_free` (which processes a single sample). It runs over the
+            whole batch at once and keeps the per-sample grouping the eval loop needs: to write
+            each sample's <|image|> placeholder run, and to stack the batch's images in sample
+            order later. It also accepts the input forms lmms-eval can pass (PIL image, file
+            path, or numpy array), which the training path never sees.
+
+        Parameters:
+         * visual_list : the batch's images, one entry per sample in batch order. Each entry is
+                         either a list of that sample's images (each a PIL image, a path string,
+                         or an (H, W, C) numpy array) or None / [] for a text-only sample.
+
+        Returns:
+            A tuple (processed_images_lists, num_soft_tokens_per_image_lists), both with one
+            entry per sample, in batch order:
+             * processed_images_lists[i] : list with one dict per image of sample i, in image
+                   order. Each dict is
+                   {"pixel_values":       (max_soft_tokens, model_flat_patch_dim) float,
+                    "image_position_ids": (max_soft_tokens, 2) int, where (-1, -1) marks a
+                                          padding patch}.
+                   The empty list when sample i is text-only.
+             * num_soft_tokens_per_image_lists[i] : list[int], one entry per image of sample i,
+                   the real (non-padding) patch count for that image. Equals the number of real
+                   rows in that image's pixel_values, so the text can write exactly that many
+                   <|image|> placeholders. The empty list when sample i is text-only.
+
+        Raises:
+            ValueError: if an image is not a PIL image, a path string, or a numpy array.
+        """
+        # ------------------------ CHANGE ------------------------
+        processed_images_lists = []
+        num_soft_tokens_per_image_lists = []
+
+        for sample in visual_list:
+            sample_dicts, sample_counts = [], []
+
+            # A text-only sample (None or []) contributes an empty group, keeping the returned
+            # lists aligned one-to-one with the batch's samples.
+            if sample is not None:
+                for visual in sample:
+                    if isinstance(visual, Image.Image):
+                        image = visual
+                    elif isinstance(visual, str): # Keep path loading for convenience
+                        image = Image.open(visual).convert("RGB")
+                    elif isinstance(visual, np.ndarray): # Keep numpy array loading for convenience
+                        image = Image.fromarray(visual)
+                    else:
+                        # If it's not an Image, a path string, or a numpy array, it's an error
+                        raise ValueError(f"Unsupported visual type: {type(visual)}. Expected PIL Image, path string, or numpy array.")
+
+                    processed_image_data = self.image_processor(image)
+
+                    sample_dicts.append({"pixel_values": processed_image_data["pixel_values"].squeeze(0),
+                                         "image_position_ids": processed_image_data["image_position_ids"].squeeze(0)})
+                    sample_counts.append(processed_image_data["num_soft_tokens_per_image"][0])
+
+            processed_images_lists.append(sample_dicts)
+            num_soft_tokens_per_image_lists.append(sample_counts)
+
+        return processed_images_lists, num_soft_tokens_per_image_lists
+    # --------------------- END OF CHANGE ---------------------
+
+    # ------------------------ CHANGE ------------------------
+    def _build_images_dict(
+        self,
+        per_sample_image_dicts: list[list[dict[str, torch.Tensor]]],
+    ) -> dict[str, torch.Tensor] | None:
+        """
+        Purpose:
+            Collapse the batch's per-sample image dicts into the single stacked image dict the
+            encoder-free model consumes. `_prepare_visual_input` keeps images grouped by sample
+            (one list per sample); the model instead wants every image in the batch stacked along
+            one leading axis. This flattens the grouping and stacks each field, preserving image
+            order, so the model's forward can embed all images at once and write their features
+            into the <|image|> placeholder positions.
+
+            The stack order is sample-major then image-major: sample 0's images in order, then
+            sample 1's, and so on -- the same order the placeholder tokens appear in across the
+            (row-major) batch. Keeping these two orders identical is what puts each image's
+            features on its own sample's placeholders; any other order would cross the wires.
+
+            Returns None when the batch has no images at all. That None is the model's text-only
+            signal (`_embed_inputs` skips the image path when `images` is None), so a batch of
+            purely text samples runs as a plain text forward.
+
+        Parameters:
+         * per_sample_image_dicts : the grouped image dicts from `_prepare_visual_input`, one
+                                    list per sample (empty for a text-only sample). Each dict is
+                                    {"pixel_values": (max_soft_tokens, model_flat_patch_dim) float,
+                                     "image_position_ids": (max_soft_tokens, 2) int}.
+
+        Returns:
+            A single dict
+            {"pixel_values":       (num_images, max_soft_tokens, model_flat_patch_dim) float,
+             "image_position_ids": (num_images, max_soft_tokens, 2) int},
+            where num_images is the total image count across the whole batch and the leading axis
+            is in sample-major, image-major order. None when the batch contains no images.
+        """
+        flat = [d for sample_dicts in per_sample_image_dicts for d in sample_dicts]
+        if not flat:
+            return None
+        return {
+            "pixel_values":       torch.stack([d["pixel_values"] for d in flat]),
+            "image_position_ids": torch.stack([d["image_position_ids"] for d in flat]),
+        }
+    # --------------------- END OF CHANGE ---------------------
+
+    # ------------------------ CHANGE ------------------------
+    def _trim_to_placeholder_count(
+        self,
+        per_sample_image_dicts: list[list[dict[str, torch.Tensor]]],
+        per_sample_soft_token_counts: list[list[int]],
+        input_ids: torch.Tensor,
+    ) -> tuple[list[list[dict[str, torch.Tensor]]], list[list[int]]]:
+        """
+        Purpose:
+            Reconcile each sample's image data with the <|image|> placeholders that actually
+            survived tokenization. The model writes one image patch feature into each <|image|>
+            placeholder, and it requires the two counts to match exactly (see `_embed_inputs`,
+            which raises if they differ). But tokenizing with truncation to `max_length` can drop
+            some of a sample's placeholders, leaving fewer placeholders than the sample has real
+            (non-padding) patches. This turns that sample's extra real patches back into padding
+            so its real-patch count matches its surviving placeholder count, letting generation run
+            instead of failing on the count mismatch.
+
+            A real patch is marked as padding the same way the processor marks one: its
+            image_position_ids row is set to (-1, -1), which drops it from the model's image path.
+            Extra patches are removed last-image-first, and within an image from the last real
+            patch backward, so trimming eats from the tail of the sample's image patches -- the
+            end that a right-truncation would have cut. Samples whose real-patch count already
+            fits (nothing was dropped) are returned unchanged.
+
+        Parameters:
+         * per_sample_image_dicts : the grouped image dicts from `_prepare_visual_input`, one list
+                                    per sample, each dict
+                                    {"pixel_values": (max_soft_tokens, model_flat_patch_dim) float,
+                                     "image_position_ids": (max_soft_tokens, 2) int}.
+
+         * per_sample_soft_token_counts : the grouped real-patch counts from `_prepare_visual_input`,
+                                          one list per sample, one int per image.
+
+         * input_ids : the tokenized, left-padded, possibly-truncated batch, shape (batch, seq).
+                       Row i holds sample i's tokens; its <|image|> placeholders are counted to
+                       learn how many real patches sample i is allowed to keep.
+
+        Returns:
+            A tuple (trimmed_dicts, trimmed_counts) with the same per-sample structure as the
+            inputs, where any sample with more real patches than surviving placeholders has had its
+            trailing real patches turned into padding (last image first) so that, per sample,
+            sum(real patches) == number of surviving <|image|> placeholders. The input structures
+            are not modified in place.
+        """
+        image_token_id = self.tokenizer.image_token_id
+        trimmed_dicts: list[list[dict[str, torch.Tensor]]] = []
+        trimmed_counts: list[list[int]] = []
+
+        for sample_idx, (sample_dicts, sample_counts) in enumerate(
+            zip(per_sample_image_dicts, per_sample_soft_token_counts)
+        ):
+            surviving = int((input_ids[sample_idx] == image_token_id).sum())
+            excess = sum(sample_counts) - surviving
+
+            if excess <= 0:
+                # Nothing was dropped for this sample; keep its data as-is.
+                trimmed_dicts.append(sample_dicts)
+                trimmed_counts.append(list(sample_counts))
+                continue
+
+            new_sample_dicts = list(sample_dicts)
+            new_sample_counts = list(sample_counts)
+            # Remove extra real patches last-image-first, trailing patches first.
+            for img_idx in range(len(new_sample_dicts) - 1, -1, -1):
+                if excess <= 0:
+                    break
+                pos = new_sample_dicts[img_idx]["image_position_ids"]
+                real_idx = (pos >= 0).all(dim=-1).nonzero(as_tuple=True)[0]  # this image's real rows
+                remove = min(excess, real_idx.numel())
+                if remove == 0:
+                    continue
+                new_pos = pos.clone()
+                new_pos[real_idx[real_idx.numel() - remove:]] = -1          # mark trailing reals as padding
+                new_sample_dicts[img_idx] = {
+                    "pixel_values": new_sample_dicts[img_idx]["pixel_values"],
+                    "image_position_ids": new_pos,
+                }
+                new_sample_counts[img_idx] -= remove
+                excess -= remove
+
+            trimmed_dicts.append(new_sample_dicts)
+            trimmed_counts.append(new_sample_counts)
+
+        return trimmed_dicts, trimmed_counts
+    # --------------------- END OF CHANGE ---------------------
+
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
         raise NotImplementedError("Loglikelihood is not implemented for nanoVLM")
 
-    def flatten(self, input):
-        new_list = []
-        for sublist in input:
-            if sublist is None:
-                new_list.append(None)
-            else:
-                for i in sublist:
-                    new_list.append(i)
-        return new_list
-    
     def get_benchmark_formatting(self, task_name: str) -> dict:
         """Get benchmark-specific formatting rules."""
         benchmark_formats = {
@@ -201,9 +383,48 @@ class NanoVLMWrapper(lmms):
         # Add assistant prefix to prompt
         if formatting["assistant_prefix"]:
             prompt = prompt + formatting["assistant_prefix"]
-        
+
         return context_str, prompt
-    
+
+    # ------------------------ CHANGE ------------------------
+    def _assemble_prompt(self, context: str, soft_token_counts: list[int], task_name: str) -> str:
+        """
+        Purpose:
+            Build the exact prompt string one sample is fed to the tokenizer, on the encoder-free
+            path. This is the single source of truth for prompt assembly: generate_until calls it
+            once per sample. It (1) applies the benchmark's context rewrites/prefixes/suffixes,
+            (2) prepends one <|image|> placeholder per real image patch (so the count matches the
+            image features the model will splice in), (3) wraps the result as a user turn and
+            renders the chat template with the generation prompt, and (4) appends the benchmark's
+            assistant cue (e.g. "Answer:") at the very end, where it steers the first generated
+            token.
+
+        Parameters:
+         * context : the task context for this sample, i.e. task.doc_to_text(doc).
+
+         * soft_token_counts : this sample's real-patch counts, one int per image (the sample's
+                               entry from `_prepare_visual_input`'s counts). Empty for a text-only
+                               sample, which yields no placeholders.
+
+         * task_name : the lmms-eval task name, used to pick the benchmark formatting.
+
+        Returns:
+            The assembled prompt string, ending in the benchmark's assistant cue when it defines
+            one, ready to tokenize.
+        """
+        # 1. benchmark text replacements / prefixes / suffixes on the context
+        context, _ = self.apply_benchmark_formatting(context, "", task_name)
+        # 2. one <|image|> placeholder per real patch, prepended before the text
+        image_string = get_image_string_encoder_free(self.tokenizer, soft_token_counts)
+        prompt_content = image_string + context
+        # 3. wrap as a user turn and render the chat template (adds the generation prompt)
+        messages = [{"role": "user", "content": prompt_content}]
+        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        # 4. append the benchmark's assistant cue at the very end
+        _, prompt = self.apply_benchmark_formatting("", prompt, task_name)
+        return prompt
+    # --------------------- END OF CHANGE ---------------------
+
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
 
@@ -224,59 +445,19 @@ class NanoVLMWrapper(lmms):
         re_ords = utils.Collator([reg.args for reg in requests], _collate, grouping=True)
         chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
         for chunk in chunks:
-            try:
-                contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
-                visuals = [dtv(self.task_dict[t][s][i]) for dtv, i, t, s in zip(doc_to_visual, doc_id, task, split)]
-                images, splitted_image_ratio = self._prepare_visual_input(self.flatten(visuals))
-            except Exception as e:
-                print(f"Error preparing visual input: {e}")
-                if len(contexts) > 0:
-                    pbar.update(len(contexts))
-                    generated_texts = [""] * len(contexts)
-                    res.extend(generated_texts)
-                continue
+            # ------------------------ CHANGE ------------------------
+            # Encoder-free rewire: keep the batch's images grouped per sample (no flatten), build
+            # each sample's placeholder run from its own real-patch counts, and let any prep error
+            # propagate -- the old broad try/except turned a real bug into "" predictions, i.e.
+            # silently wrong scores.
+            contexts, all_gen_kwargs, doc_to_visual, doc_id, task, split = zip(*chunk)
+            # visuals: one entry per sample -- a list of that sample's images, or None if text-only.
+            visuals = [dtv(self.task_dict[t][s][i]) for dtv, i, t, s in zip(doc_to_visual, doc_id, task, split)]
+            dicts, counts = self._prepare_visual_input(visuals)
 
-            messages = []
-            splitted_image_idx = 0
-            for i in range(len(contexts)):
-                current_context_str = contexts[i]
-                
-                # Apply benchmark-specific text replacements
-                current_context_str, _ = self.apply_benchmark_formatting(current_context_str, "", task[i])
-                
-                if visuals[i] is None:
-                    image_count = 0
-                else:
-                    image_count = len(visuals[i])
-                image_string = ""
-                for _ in range(image_count):
-                    image_string += get_image_string(self.tokenizer, [splitted_image_ratio[splitted_image_idx]], self.model.cfg.mp_image_token_length)
-                    splitted_image_idx += 1
-
-                prompt_content = image_string + current_context_str
-                
-                # Format text_data as a list of message dictionaries
-                messages_for_item = [{"role": "user", "content": prompt_content}]
-                messages.append(messages_for_item)
-                
-                # # Process images; _prepare_visual_input returns a stacked tensor or None
-                # processed_images_tensor = self._prepare_visual_input(current_visuals_list) if current_visuals_list else None
-                # images.append(processed_images_tensor)
-                
-            prompts = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            pr = False
-            if pr:
-                print(task[0])
-                print("Original Prompt")
-                print(prompts[0])
-
-            # Apply benchmark-specific assistant prefixes
-            for i in range(len(prompts)):
-                _, prompts[i] = self.apply_benchmark_formatting("", prompts[i], task[i])
-
-            if pr:
-                print("Formatted Prompt")
-                print(prompts[0])
+            # One assembled prompt per sample (single source of truth: _assemble_prompt).
+            prompts = [self._assemble_prompt(contexts[i], counts[i], task[i]) for i in range(len(contexts))]
+            # --------------------- END OF CHANGE ---------------------
 
             inputs = self.tokenizer(
                 prompts,
@@ -289,7 +470,15 @@ class NanoVLMWrapper(lmms):
 
             input_ids = inputs["input_ids"].to(self.device)
             attention_mask = inputs["attention_mask"].to(self.device)
-            # images = images.to(self.device)
+
+            # ------------------------ CHANGE ------------------------
+            # Truncation to max_length may have dropped some <|image|> placeholders; turn the
+            # matching real patches back into padding so, per sample, real patches == surviving
+            # placeholders, then stack the batch's images into the single dict the model consumes
+            # (None when the batch has no images).
+            dicts, counts = self._trim_to_placeholder_count(dicts, counts, input_ids)
+            images_dict = self._build_images_dict(dicts)
+            # --------------------- END OF CHANGE ---------------------
 
             # Extract generation parameters for the batch
             # We use the gen_kwargs from the first item in the chunk, assuming they are uniform for the batch.
@@ -307,8 +496,8 @@ class NanoVLMWrapper(lmms):
             # Generate
             generated_ids_batch = self.model.generate(
                 input_ids,
-                images,
-                attention_mask,
+                images_dict,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 greedy=greedy,
                 temperature=gen_temperature,
@@ -321,8 +510,6 @@ class NanoVLMWrapper(lmms):
                 generated_ids_batch,
                 skip_special_tokens=True
             )
-            if pr:
-                print(generated_texts[0])
             res.extend(generated_texts)
             pbar.update(len(contexts))
 

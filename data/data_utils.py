@@ -6,20 +6,33 @@ def _is_batch_valid(batch):
     """
     Check if a batch is valid for training/evaluation.
     A valid batch must have input_ids and at least one image.
+
+    `batch['images']` takes one of two shapes depending on the vision backend's collator:
+      * encoder-free: a dict {"pixel_values", "image_position_ids"} of stacked tensors, or None
+        for a batch with no images.
+      * ViT: a list of lists of tensors, or [] for a batch with no images.
+    A batch with no image is invalid on either path: during training a batch without images
+    produces gradients that skip some model parameters, which deadlocks DDP.
     """
     if not batch:
         return False
     # The collator can return a batch with empty lists
     if len(batch['input_ids']) == 0:
         return False
-    
-    if len(batch['images']) == 0:
+
+    images = batch['images']
+
+    # Encoder-free path: None means no images; a dict always carries at least one image row.
+    if images is None:
         return False
-    
-    # `images` is a list of lists of tensors. Check that at least one image is not None.
-    if len([img for sublist in batch['images'] for img in sublist]) == 0:
-        # During training, not having images creates gradients computed without all model parameters.
-        # This creates deadlocks in DDP.
+    if isinstance(images, dict):
+        return images['pixel_values'].shape[0] > 0
+
+    # ViT path: `images` is a list of lists of tensors.
+    if len(images) == 0:
+        return False
+    # Check that at least one image is present across the batch's samples.
+    if len([img for sublist in images for img in sublist]) == 0:
         return False
 
     return True

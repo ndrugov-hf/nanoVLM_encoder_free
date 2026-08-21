@@ -9,10 +9,18 @@
 #SBATCH --qos=normal
 
 # Change to project directory
-cd /fsx/luis_wiedmann/nanoVLM
+cd /fsx/$USER/nanoVLM_encoder_free
 
 # Activate virtual environment
 source .venv/bin/activate
+export HF_TOKEN=$(cat "$HOME/.cache/huggingface/token")
 
 # Run using torchrun
-torchrun --nproc_per_node=8 train.py
+# -------------- CHANGE ----------
+# Old: torchrun --nproc_per_node=8 train.py
+#   Bare torchrun defaults to MASTER_PORT=29500. Give each job a unique port
+#   derived from SLURM_JOB_ID so parallel runs never collide on the same node.
+# New:
+export MASTER_PORT=$(( 20000 + SLURM_JOB_ID % 40000 ))
+torchrun --nproc_per_node=8 --master_port=$MASTER_PORT train.py
+# -------------- END OF CHANGE ----------
