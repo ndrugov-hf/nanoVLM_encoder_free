@@ -1,42 +1,60 @@
-# nanoVLM (encoder-free)
+# nanoVLM with a Gemma 4 vision path
 
-This is a fork of [nanoVLM](https://github.com/huggingface/nanoVLM) with the vision encoder removed. Raw pixel patches go through one small embedding layer and land directly in the language model's input sequence, following the encoder-free design of Gemma 4. For everything the two repos share (the training loop, data packing, the overall philosophy, how to get started) read the upstream README. This file describes what is different here.
+This fork adapts [nanoVLM](https://github.com/huggingface/nanoVLM) to follow the vision architecture used by Gemma 4 12B. It splits images into raw pixel patches, turns each patch into an embedding with a small module, and places those embeddings in the language model's input sequence. 
 
 ## The vision path
 
-Upstream encodes each image with a SigLIP ViT (`models/vision_transformer.py`) and shrinks the resulting features with a pixel-shuffle projector. Here the image itself becomes the input. The processor resizes each image so it fits a fixed patch budget while keeping its aspect ratio, cuts it into 32 px model patches, and flattens every patch into 3072 raw pixel values. Those values are what the model sees.
+Upstream nanoVLM processes images with a SigLIP ViT in `models/vision_transformer.py`. This fork uses the image patches themselves as model inputs.
 
-The pieces, in the order data flows through them:
+The processor resizes each image while preserving its aspect ratio. It then divides the image into 32-pixel patches and flattens each patch into 3,072 pixel values.
 
-- `data/image_processing.py` (~300 lines) reimplements Gemma 4's image-processing contract on top of a plain `VLMConfig`, without the HF framework packaging. Every image gets a patch budget from the fixed set {70, 140, 280, 560, 1120}, with 280 as the default. Pixels are rescaled to the 0..1 range and left otherwise untouched (Gemma 4 runs with `do_normalize=False`). All of this happens in the data-loading workers on CPU, so the GPU never waits on preprocessing.
-- `models/vision_embedder.py` (~130 lines) replaces the ViT. Each flattened patch runs through LayerNorm, then a Linear into `mm_embed_dim`, then LayerNorm again, and picks up a learned factorized 2D positional embedding for its (x, y) spot in the image grid. That is the entire vision tower.
-- `models/vision_projector.py` (~30 lines) maps embedder output into the language model's width: RMSNorm followed by a Linear without bias. It keeps the patch count unchanged. Pixel-shuffle downsampling exists only on the ViT path.
+- `data/image_processing.py` implements the Gemma 4 image-processing format with a plain `VLMConfig`. It assigns each image a patch budget from `{70, 140, 280, 560, 1120}`, using 280 by default. Pixel values are scaled to the `0..1` range. Data-loading workers handle this work on the CPU.
 
-## Image tokens in the text
+- `models/vision_embedder.py` turns each flattened patch into an embedding. The patch passes through LayerNorm, a Linear layer with an output width of `mm_embed_dim`, and another LayerNorm. A learned factorized 2D positional embedding records its location in the image grid.
 
-Each image appears in the prompt as a run of `<|image|>` placeholders, exactly one per model patch the processor produced for that image. The model writes one patch embedding into each placeholder position (`_replace_img_tokens_with_embd` in `models/vision_language_model.py`), and a count mismatch raises immediately. Upstream's grid-layout tokens (`<|global_image|>`, `<row_i_col_j>`) are gone from the vocabulary on this path. The grid position of every patch travels as plain numbers in `image_position_ids`, where padding rows are marked `(-1, -1)` and dropped before the embedder sees them.
+- `models/vision_projector.py` maps each embedding to the language model's width. It applies RMSNorm followed by a Linear layer without bias. The number of patches stays the same.
 
-## The language side
+## Image tokens in the prompt
 
-`models/decoder.py` (~200 lines) wraps any HuggingFace `AutoModelForCausalLM` behind the same surface the VLM expects from the hand-written language model, so the rest of the code cannot tell the two apart. Set `lm_backend = "hf"` in the config to use the wrapper or `"custom"` for upstream's Llama-style stack. The default backbone is `LiquidAI/LFM2.5-1.2B-Instruct`, and `models/config_lfm.py` / `models/config_smollm.py` carry ready-made configs for LFM2.5-230M and SmolLM2-360M-Instruct.
+Each image appears in the prompt as a sequence of `<|image|>` tokens. The processor creates one token for every image patch.
 
-## Switching between the two vision paths
+`_replace_img_tokens_with_embd` in `models/vision_language_model.py` places the patch embeddings at those token positions. It raises an error when the number of tokens and embeddings differs.
 
-`vision_backend` in `models/config.py` selects `"encoder_free"` (the default) or `"vit"`. The ViT path stayed fully wired during the migration and still works, which made every step of the switch testable against a known-good reference.
+Patch coordinates travel through `image_position_ids`. Padding uses `(-1, -1)` coordinates, which the embedder removes before processing. The encoder-free path uses these coordinates in place of upstream nanoVLM's grid tokens such as `<|global_image|>` and `<row_i_col_j>`.
+
+## The language model
+
+`models/decoder.py` wraps Hugging Face models loaded through `AutoModelForCausalLM`. The wrapper exposes the interface expected by the rest of nanoVLM.
+
+Set `lm_backend = "hf"` to use a Hugging Face model. The `"custom"` option selects the original Llama-style implementation from nanoVLM.
+
+The default language model is `LiquidAI/LFM2.5-1.2B-Instruct`. Ready-made configurations for LFM2.5-230M and SmolLM2-360M-Instruct are available in `models/config_lfm.py` and `models/config_smollm.py`.
+
+## Choosing a vision backend
+
+Set `vision_backend` in `models/config.py` to choose the vision path.
+
+- `"encoder_free"` uses the Gemma 4-style patch embedder and projector. This is the default.
+
+- `"vit"` uses the original ViT path from nanoVLM.
+
+The ViT path remains available for tests and architecture comparisons.
 
 ## Evaluation
 
-`eval/lmms_eval_wrapper.py` speaks the encoder-free input format, so [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) benchmarks run against these models the same way they do upstream. `eval.slurm` fans the benchmark tasks out across GPUs and `merge_eval_results.py` combines the per-task outputs into one result file per checkpoint.
+`eval/lmms_eval_wrapper.py` prepares encoder-free inputs for [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval).
+
+`eval.slurm` distributes benchmark tasks across GPUs. After evaluation, `merge_eval_results.py` combines the task outputs into one result file for each checkpoint.
 
 ## Tests
 
-The `tests/` directory holds over 200 unit tests covering the image processor, the embedder, the projector, the data pipeline, packing, the eval wrapper, and the model wiring, on CPU with random weights. `sbatch tests/gpu_smoke_test.slurm` runs the paths that need real weights and a GPU: an autocast training step, generation, and save/resume.
+The `tests/` directory contains more than 200 CPU tests. They cover image processing, patch embeddings, projection, data loading, sequence packing, evaluation, and model wiring with randomly initialized weights.
 
 ## Citation
 
-If you use this repository, please cite the upstream nanoVLM work:
+If you use this repository, please cite nanoVLM:
 
-```
+```java
 @misc{wiedmann2025nanovlm,
   author = {Luis Wiedmann and Aritra Roy Gosthipaty and Andrés Marafioti},
   title = {nanoVLM},
